@@ -2,8 +2,8 @@
 // refs, branch file state, issues, pull requests, comments and labels.
 //
 // Determinism: ids and numbers come from counters; every timestamp is the fixed constant.
-// Nothing here reads the clock or randomness, so two runs over the same requests answer the
-// same bytes.
+// Nothing here reads the clock or randomness, so two runs over the same requests answer
+// the same bytes.
 
 import {
   ZERO_OID,
@@ -111,21 +111,21 @@ export function getRepo(store: Store, owner: string, name: string): Repo | undef
 
 /** The flat file map of a commit's tree, by walking tree objects recursively. */
 export function filesOfCommit(repo: Repo, commitOid: string): Map<string, FileEntry> {
-  const files = new Map<string, FileEntry>();
-  const object = repo.objects.get(commitOid);
-  if (!object || object.type !== 'commit') return files;
-  const rootTree = parseCommit(object.data).tree;
-  const walk = (treeOid: string, prefix: string): void => {
-    const treeObject = repo.objects.get(treeOid);
-    if (!treeObject || treeObject.type !== 'tree') return;
-    for (const entry of parseTree(treeObject.data)) {
-      const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-      if (entry.mode === '40000') walk(entry.oid, path);
-      else files.set(path, { oid: entry.oid, mode: entry.mode });
+  const acc = new Map<string, FileEntry>();
+  const found = repo.objects.get(commitOid);
+  if (!found || found.type !== 'commit') return acc;
+  const topTree = parseCommit(found.data).tree;
+  const descend = (nodeOid: string, prefix: string): void => {
+    const nodeObj = repo.objects.get(nodeOid);
+    if (!nodeObj || nodeObj.type !== 'tree') return;
+    for (const child of parseTree(nodeObj.data)) {
+      const full = prefix === '' ? child.name : `${prefix}/${child.name}`;
+      if (child.mode === '40000') descend(child.oid, full);
+      else acc.set(full, { oid: child.oid, mode: child.mode });
     }
   };
-  walk(rootTree, '');
-  return files;
+  descend(topTree, '');
+  return acc;
 }
 
 /**
@@ -133,42 +133,42 @@ export function filesOfCommit(repo: Repo, commitOid: string): Map<string, FileEn
  * Directories are created for every path prefix that holds a file.
  */
 export function treeOidOfFiles(repo: Repo, files: Map<string, FileEntry>): string {
-  interface Node {
+  interface DirNode {
     files: Map<string, FileEntry>;
-    dirs: Map<string, Node>;
+    dirs: Map<string, DirNode>;
   }
-  const root: Node = { files: new Map(), dirs: new Map() };
+  const top: DirNode = { files: new Map(), dirs: new Map() };
   for (const [path, entry] of files) {
     const parts = path.split('/');
-    let node = root;
+    let cursor = top;
     for (let i = 0; i < parts.length - 1; i += 1) {
-      const part = parts[i]!;
-      let child = node.dirs.get(part);
-      if (!child) {
-        child = { files: new Map(), dirs: new Map() };
-        node.dirs.set(part, child);
+      const seg = parts[i]!;
+      let next = cursor.dirs.get(seg);
+      if (!next) {
+        next = { files: new Map(), dirs: new Map() };
+        cursor.dirs.set(seg, next);
       }
-      node = child;
+      cursor = next;
     }
-    node.files.set(parts[parts.length - 1]!, entry);
+    cursor.files.set(parts[parts.length - 1]!, entry);
   }
-  const build = (node: Node): string => {
-    const entries: { mode: string; name: string; oid: string }[] = [];
-    for (const [name, entry] of node.files) entries.push({ mode: entry.mode, name, oid: entry.oid });
-    for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, oid: build(child) });
-    const data = buildTree(entries);
-    const oid = hashObject('tree', data);
-    repo.objects.set(oid, { type: 'tree', data });
-    return oid;
+  const assemble = (node: DirNode): string => {
+    const rows: { mode: string; name: string; oid: string }[] = [];
+    for (const [name, entry] of node.files) rows.push({ mode: entry.mode, name, oid: entry.oid });
+    for (const [name, child] of node.dirs) rows.push({ mode: '40000', name, oid: assemble(child) });
+    const blob = buildTree(rows);
+    const treeId = hashObject('tree', blob);
+    repo.objects.set(treeId, { type: 'tree', data: blob });
+    return treeId;
   };
-  return build(root);
+  return assemble(top);
 }
 
 /** Store an object, returning its oid. */
 export function putObject(repo: Repo, type: GitObjectType, data: Buffer): string {
-  const oid = hashObject(type, data);
-  repo.objects.set(oid, { type, data });
-  return oid;
+  const id = hashObject(type, data);
+  repo.objects.set(id, { type, data });
+  return id;
 }
 
 /**
@@ -182,44 +182,44 @@ export function commitFiles(
   message: string,
   parents: readonly string[],
 ): string {
-  const treeOid = treeOidOfFiles(repo, files);
-  const commitData = buildCommit({ tree: treeOid, parents, message });
-  const commitOid = putObject(repo, 'commit', commitData);
-  repo.refs.set(`refs/heads/${branch}`, commitOid);
+  const topTree = treeOidOfFiles(repo, files);
+  const raw = buildCommit({ tree: topTree, parents, message });
+  const id = putObject(repo, 'commit', raw);
+  repo.refs.set(`refs/heads/${branch}`, id);
   repo.branchFiles.set(branch, new Map(files));
-  return commitOid;
+  return id;
 }
 
 /** The first commit reachable from both `a` and `b` (BFS from both sides, oldest first). */
 export function mergeBase(repo: Repo, a: string, b: string): string | null {
   if (a === b) return a;
-  const ancestors = (start: string): Map<string, number> => {
-    const seen = new Map<string, number>();
-    const queue: Array<[string, number]> = [[start, 0]];
-    while (queue.length > 0) {
-      const [oid, depth] = queue.shift()!;
-      if (seen.has(oid)) continue;
-      seen.set(oid, depth);
-      const object = repo.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
-      for (const parent of parseCommit(object.data).parents) queue.push([parent, depth + 1]);
+  const walkBack = (start: string): Map<string, number> => {
+    const visited = new Map<string, number>();
+    const pending: Array<[string, number]> = [[start, 0]];
+    while (pending.length > 0) {
+      const [id, level] = pending.shift()!;
+      if (visited.has(id)) continue;
+      visited.set(id, level);
+      const found = repo.objects.get(id);
+      if (!found || found.type !== 'commit') continue;
+      for (const parent of parseCommit(found.data).parents) pending.push([parent, level + 1]);
     }
-    return seen;
+    return visited;
   };
-  const fromA = ancestors(a);
-  const fromB = ancestors(b);
-  let best: string | null = null;
-  let bestDepth = Infinity;
-  for (const [oid, depthA] of fromA) {
-    const depthB = fromB.get(oid);
-    if (depthB === undefined) continue;
-    const depth = depthA + depthB;
-    if (depth < bestDepth) {
-      bestDepth = depth;
-      best = oid;
+  const sideA = walkBack(a);
+  const sideB = walkBack(b);
+  let winner: string | null = null;
+  let bestSum = Infinity;
+  for (const [id, levelA] of sideA) {
+    const levelB = sideB.get(id);
+    if (levelB === undefined) continue;
+    const sum = levelA + levelB;
+    if (sum < bestSum) {
+      bestSum = sum;
+      winner = id;
     }
   }
-  return best;
+  return winner;
 }
 
 /** The file-level diff from `oldFiles` to `newFiles`. */
@@ -227,48 +227,48 @@ export function diffFiles(
   oldFiles: Map<string, FileEntry>,
   newFiles: Map<string, FileEntry>,
 ): Array<{ path: string; status: 'added' | 'removed' | 'modified'; oldOid: string | null; newOid: string | null }> {
-  const changes: Array<{ path: string; status: 'added' | 'removed' | 'modified'; oldOid: string | null; newOid: string | null }> = [];
+  const edits: Array<{ path: string; status: 'added' | 'removed' | 'modified'; oldOid: string | null; newOid: string | null }> = [];
   for (const [path, entry] of newFiles) {
-    const old = oldFiles.get(path);
-    if (!old) changes.push({ path, status: 'added', oldOid: null, newOid: entry.oid });
-    else if (old.oid !== entry.oid) changes.push({ path, status: 'modified', oldOid: old.oid, newOid: entry.oid });
+    const prior = oldFiles.get(path);
+    if (!prior) edits.push({ path, status: 'added', oldOid: null, newOid: entry.oid });
+    else if (prior.oid !== entry.oid) edits.push({ path, status: 'modified', oldOid: prior.oid, newOid: entry.oid });
   }
   for (const path of oldFiles.keys()) {
-    if (!newFiles.has(path)) changes.push({ path, status: 'removed', oldOid: oldFiles.get(path)!.oid, newOid: null });
+    if (!newFiles.has(path)) edits.push({ path, status: 'removed', oldOid: oldFiles.get(path)!.oid, newOid: null });
   }
-  changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return changes;
+  edits.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return edits;
 }
 
 /** Count the lines of a blob's text (a trailing newline does not add a line). */
 export function lineCount(repo: Repo, oid: string | null): number {
   if (oid === null) return 0;
-  const object = repo.objects.get(oid);
-  if (!object) return 0;
-  const text = object.data.toString('utf8');
-  if (text === '') return 0;
-  const lines = text.split('\n');
-  return lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+  const found = repo.objects.get(oid);
+  if (!found) return 0;
+  const body = found.data.toString('utf8');
+  if (body === '') return 0;
+  const parts = body.split('\n');
+  return parts[parts.length - 1] === '' ? parts.length - 1 : parts.length;
 }
 
 /** True when merging `headTip` into `baseTip` would conflict on a file both sides changed. */
 export function mergeConflicts(repo: Repo, baseTip: string, headTip: string): boolean {
-  const base = mergeBase(repo, baseTip, headTip);
-  if (base === null) return false;
-  const baseFiles = filesOfCommit(repo, base);
-  const headFiles = filesOfCommit(repo, headTip);
-  const baseNowFiles = filesOfCommit(repo, baseTip);
-  const headChanges = diffFiles(baseFiles, headFiles);
-  const baseChanges = new Map(diffFiles(baseFiles, baseNowFiles).map((c) => [c.path, c]));
-  for (const change of headChanges) {
-    const other = baseChanges.get(change.path);
-    if (!other) continue;
+  const fork = mergeBase(repo, baseTip, headTip);
+  if (fork === null) return false;
+  const forkFiles = filesOfCommit(repo, fork);
+  const tipFiles = filesOfCommit(repo, headTip);
+  const nowFiles = filesOfCommit(repo, baseTip);
+  const tipEdits = diffFiles(forkFiles, tipFiles);
+  const nowEdits = new Map(diffFiles(forkFiles, nowFiles).map((c) => [c.path, c]));
+  for (const edit of tipEdits) {
+    const match = nowEdits.get(edit.path);
+    if (!match) continue;
     // Both sides changed the same path: a conflict unless they landed on the same content.
-    if (change.status === 'removed' || other.status === 'removed') {
-      if (change.status !== other.status) return true;
+    if (edit.status === 'removed' || match.status === 'removed') {
+      if (edit.status !== match.status) return true;
       continue;
     }
-    if (change.newOid !== other.newOid) return true;
+    if (edit.newOid !== match.newOid) return true;
   }
   return false;
 }
@@ -281,7 +281,7 @@ export function createRepo(
   name: string,
   options: { description?: string; private?: boolean },
 ): Repo {
-  const repo: Repo = {
+  const fresh: Repo = {
     id: store.nextRepoId++,
     name,
     owner,
@@ -300,11 +300,11 @@ export function createRepo(
     nextCommentId: 1,
   };
   // The six labels the suite feature-detects; creating them up front is what GitHub does.
-  for (const labelName of ['bug', 'enhancement', 'documentation', 'question', 'good first issue', 'help wanted']) {
-    repo.labels.set(labelName, { name: labelName, color: 'ededed', description: '' });
+  for (const tag of ['bug', 'enhancement', 'documentation', 'question', 'good first issue', 'help wanted']) {
+    fresh.labels.set(tag, { name: tag, color: 'ededed', description: '' });
   }
-  store.repos.set(repoKey(owner, name), repo);
-  return repo;
+  store.repos.set(repoKey(owner, name), fresh);
+  return fresh;
 }
 
 export function deleteRepo(store: Store, owner: string, name: string): boolean {
@@ -330,17 +330,17 @@ export function putContents(
   message: string,
   sha?: string,
 ): ContentsResult | { error: 'stale-sha' } | { error: 'not-found' } {
-  const head = repo.refs.get(`refs/heads/${branch}`);
-  const files = head ? new Map(repo.branchFiles.get(branch) ?? filesOfCommit(repo, head)) : new Map<string, FileEntry>();
-  const existing = files.get(path);
+  const tip = repo.refs.get(`refs/heads/${branch}`);
+  const acc = tip ? new Map(repo.branchFiles.get(branch) ?? filesOfCommit(repo, tip)) : new Map<string, FileEntry>();
+  const current = acc.get(path);
   if (sha !== undefined) {
-    if (!existing || existing.oid !== sha) return { error: 'stale-sha' };
+    if (!current || current.oid !== sha) return { error: 'stale-sha' };
   }
-  const blobOid = putObject(repo, 'blob', content);
-  files.set(path, { oid: blobOid, mode: '100644' });
-  const parents = head && head !== ZERO_OID ? [head] : [];
-  const commitSha = commitFiles(repo, branch, files, message, parents);
-  return { commitSha, contentSha: blobOid };
+  const blobId = putObject(repo, 'blob', content);
+  acc.set(path, { oid: blobId, mode: '100644' });
+  const links = tip && tip !== ZERO_OID ? [tip] : [];
+  const commitId = commitFiles(repo, branch, acc, message, links);
+  return { commitSha: commitId, contentSha: blobId };
 }
 
 /** DELETE /contents: remove a file from a branch. */
@@ -351,15 +351,15 @@ export function deleteContents(
   message: string,
   sha?: string,
 ): ContentsResult | { error: 'stale-sha' } | { error: 'not-found' } {
-  const head = repo.refs.get(`refs/heads/${branch}`);
-  if (!head) return { error: 'not-found' };
-  const files = new Map(repo.branchFiles.get(branch) ?? filesOfCommit(repo, head));
-  const existing = files.get(path);
-  if (!existing) return { error: 'not-found' };
-  if (sha !== undefined && existing.oid !== sha) return { error: 'stale-sha' };
-  files.delete(path);
-  const commitSha = commitFiles(repo, branch, files, message, [head]);
-  return { commitSha, contentSha: existing.oid };
+  const tip = repo.refs.get(`refs/heads/${branch}`);
+  if (!tip) return { error: 'not-found' };
+  const acc = new Map(repo.branchFiles.get(branch) ?? filesOfCommit(repo, tip));
+  const current = acc.get(path);
+  if (!current) return { error: 'not-found' };
+  if (sha !== undefined && current.oid !== sha) return { error: 'stale-sha' };
+  acc.delete(path);
+  const commitId = commitFiles(repo, branch, acc, message, [tip]);
+  return { commitSha: commitId, contentSha: current.oid };
 }
 
 // --------------------------------------------------------------------------- issues
@@ -369,33 +369,33 @@ export function createIssue(
   repo: Repo,
   input: { title: string; body?: string; labels?: string[] },
 ): Issue | { error: 'bad-label'; label: string } {
-  const labels: Label[] = [];
-  for (const name of input.labels ?? []) {
-    const label = repo.labels.get(name);
-    if (!label) return { error: 'bad-label', label: name };
-    labels.push(label);
+  const picked: Label[] = [];
+  for (const wanted of input.labels ?? []) {
+    const found = repo.labels.get(wanted);
+    if (!found) return { error: 'bad-label', label: wanted };
+    picked.push(found);
   }
-  const number = repo.nextNumber++;
-  const issue: Issue = {
+  const num = repo.nextNumber++;
+  const fresh: Issue = {
     id: store.nextIssueId++,
-    number,
+    number: num,
     title: input.title,
     body: input.body ?? '',
     state: 'open',
-    labels,
+    labels: picked,
     comments: [],
     created_at: FIXED_TIME,
     updated_at: FIXED_TIME,
     closed_at: null,
   };
-  repo.issues.set(number, issue);
-  return issue;
+  repo.issues.set(num, fresh);
+  return fresh;
 }
 
 export function addIssueComment(repo: Repo, issue: Issue, body: string): IssueComment {
-  const comment: IssueComment = { id: repo.nextCommentId++, body, created_at: FIXED_TIME };
-  issue.comments.push(comment);
-  return comment;
+  const note: IssueComment = { id: repo.nextCommentId++, body, created_at: FIXED_TIME };
+  issue.comments.push(note);
+  return note;
 }
 
 // --------------------------------------------------------------------------- pulls
@@ -407,10 +407,10 @@ export function createPull(
 ): Pull | { error: 'unknown-branch'; branch: string } {
   if (!repo.refs.has(`refs/heads/${input.head}`)) return { error: 'unknown-branch', branch: input.head };
   if (!repo.refs.has(`refs/heads/${input.base}`)) return { error: 'unknown-branch', branch: input.base };
-  const number = repo.nextNumber++;
-  const pull: Pull = {
+  const num = repo.nextNumber++;
+  const fresh: Pull = {
     id: store.nextPullId++,
-    number,
+    number: num,
     title: input.title,
     body: input.body ?? '',
     state: 'open',
@@ -422,8 +422,8 @@ export function createPull(
     created_at: FIXED_TIME,
     updated_at: FIXED_TIME,
   };
-  repo.pulls.set(number, pull);
-  return pull;
+  repo.pulls.set(num, fresh);
+  return fresh;
 }
 
 /** The files a pull request changes, head vs merge-base, with line counts. */
@@ -434,21 +434,21 @@ export function pullFiles(repo: Repo, pull: Pull): Array<{
   deletions: number;
   changes: number;
 }> {
-  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
-  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-  if (!headTip || !baseTip) return [];
-  const base = mergeBase(repo, headTip, baseTip) ?? baseTip;
-  const baseFiles = filesOfCommit(repo, base);
-  const headFiles = filesOfCommit(repo, headTip);
-  return diffFiles(baseFiles, headFiles).map((change) => {
-    const additions = change.status === 'removed' ? 0 : lineCount(repo, change.newOid);
-    const deletions = change.status === 'added' ? 0 : lineCount(repo, change.oldOid);
+  const tipA = repo.refs.get(`refs/heads/${pull.headRef}`);
+  const tipB = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  if (!tipA || !tipB) return [];
+  const fork = mergeBase(repo, tipA, tipB) ?? tipB;
+  const forkFiles = filesOfCommit(repo, fork);
+  const tipFiles = filesOfCommit(repo, tipA);
+  return diffFiles(forkFiles, tipFiles).map((edit) => {
+    const added = edit.status === 'removed' ? 0 : lineCount(repo, edit.newOid);
+    const removed = edit.status === 'added' ? 0 : lineCount(repo, edit.oldOid);
     return {
-      filename: change.path,
-      status: change.status === 'modified' ? 'modified' : change.status,
-      additions,
-      deletions,
-      changes: additions + deletions,
+      filename: edit.path,
+      status: edit.status === 'modified' ? 'modified' : edit.status,
+      additions: added,
+      deletions: removed,
+      changes: added + removed,
     };
   });
 }
@@ -462,58 +462,58 @@ export function mergePull(
   pull: Pull,
 ): { mergeSha: string } | { error: 'conflict' } | { error: 'already-merged' } {
   if (pull.merged || pull.state === 'closed') return { error: 'already-merged' };
-  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
-  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-  if (!headTip || !baseTip) return { error: 'conflict' };
-  if (mergeConflicts(repo, baseTip, headTip)) return { error: 'conflict' };
-  const base = mergeBase(repo, headTip, baseTip) ?? baseTip;
-  const baseFiles = filesOfCommit(repo, base);
-  const headFiles = filesOfCommit(repo, headTip);
-  const baseNowFiles = filesOfCommit(repo, baseTip);
+  const tipA = repo.refs.get(`refs/heads/${pull.headRef}`);
+  const tipB = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  if (!tipA || !tipB) return { error: 'conflict' };
+  if (mergeConflicts(repo, tipB, tipA)) return { error: 'conflict' };
+  const fork = mergeBase(repo, tipA, tipB) ?? tipB;
+  const forkFiles = filesOfCommit(repo, fork);
+  const tipFiles = filesOfCommit(repo, tipA);
+  const nowFiles = filesOfCommit(repo, tipB);
   // Squash: the merged tree is the base tip's tree with the head's changes applied.
-  const merged = new Map(baseNowFiles);
-  for (const change of diffFiles(baseFiles, headFiles)) {
-    if (change.status === 'removed') merged.delete(change.path);
-    else merged.set(change.path, { oid: change.newOid!, mode: '100644' });
+  const next = new Map(nowFiles);
+  for (const edit of diffFiles(forkFiles, tipFiles)) {
+    if (edit.status === 'removed') next.delete(edit.path);
+    else next.set(edit.path, { oid: edit.newOid!, mode: '100644' });
   }
-  const treeOid = treeOidOfFiles(repo, merged);
-  const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
-  const commitData = buildCommit({ tree: treeOid, parents: [baseTip], message });
-  const mergeSha = putObject(repo, 'commit', commitData);
-  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
-  repo.branchFiles.set(pull.baseRef, new Map(merged));
+  const topTree = treeOidOfFiles(repo, next);
+  const title = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
+  const raw = buildCommit({ tree: topTree, parents: [tipB], message: title });
+  const id = putObject(repo, 'commit', raw);
+  repo.refs.set(`refs/heads/${pull.baseRef}`, id);
+  repo.branchFiles.set(pull.baseRef, new Map(next));
   pull.merged = true;
   pull.state = 'closed';
   pull.merged_at = FIXED_TIME;
-  pull.merge_commit_sha = mergeSha;
+  pull.merge_commit_sha = id;
   pull.updated_at = FIXED_TIME;
-  return { mergeSha };
+  return { mergeSha: id };
 }
 
 // --------------------------------------------------------------------------- tags / refs
 
 /** Create an annotated tag object and point refs/tags/<name> at it. */
 export function createTag(repo: Repo, name: string, targetOid: string, targetType: GitObjectType, message: string): string {
-  const tagData = buildTag({ object: targetOid, type: targetType, tag: name, message });
-  const tagOid = putObject(repo, 'tag', tagData);
-  repo.refs.set(`refs/tags/${name}`, tagOid);
-  return tagOid;
+  const raw = buildTag({ object: targetOid, type: targetType, tag: name, message });
+  const id = putObject(repo, 'tag', raw);
+  repo.refs.set(`refs/tags/${name}`, id);
+  return id;
 }
 
 /** True when `ancestor` is reachable from `descendant` following commit parents only (no trees). */
 export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  const seen = new Set<string>([descendant]);
-  const queue = [descendant];
-  while (queue.length > 0) {
-    const oid = queue.pop()!;
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
-      if (parent === ancestor) return true;
-      if (!seen.has(parent)) {
-        seen.add(parent);
-        queue.push(parent);
+  const visited = new Set<string>([descendant]);
+  const pending = [descendant];
+  while (pending.length > 0) {
+    const id = pending.pop()!;
+    const found = repo.objects.get(id);
+    if (!found || found.type !== 'commit') continue;
+    for (const link of parseCommit(found.data).parents) {
+      if (link === ancestor) return true;
+      if (!visited.has(link)) {
+        visited.add(link);
+        pending.push(link);
       }
     }
   }
@@ -522,9 +522,9 @@ export function isAncestor(repo: Repo, ancestor: string, descendant: string): bo
 
 /** Peel a ref to its commit: a tag ref peels to the tag's target, a branch ref is itself. */
 export function peelToCommit(repo: Repo, oid: string): string {
-  const object = repo.objects.get(oid);
-  if (!object) return oid;
-  if (object.type === 'tag') return parseTag(object.data).object;
+  const found = repo.objects.get(oid);
+  if (!found) return oid;
+  if (found.type === 'tag') return parseTag(found.data).object;
   return oid;
 }
 
@@ -535,65 +535,65 @@ export function fetchObjects(
   haves: readonly string[],
   options: { depth?: number; shallowBoundaries?: readonly string[] } = {},
 ): { objects: Map<string, GitObject>; shallow: string[]; unshallow: string[] } {
-  const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
+  const fetch = (oid: string): GitObject | undefined => repo.objects.get(oid);
   // What the client already holds: the full closure of its haves, except a shallow
   // boundary is a root whose parents the client does NOT have (it holds only the tip).
-  const cutoff = new Set<string>(options.shallowBoundaries ?? []);
-  const haveReachable = collectReachable(haves, lookup, { allowMissing: true, cutoff });
-  const objects = new Map<string, GitObject>();
-  const shallow: string[] = [];
-  const unshallow: string[] = [];
+  const edge = new Set<string>(options.shallowBoundaries ?? []);
+  const held = collectReachable(haves, fetch, { allowMissing: true, cutoff: edge });
+  const picked = new Map<string, GitObject>();
+  const cut: string[] = [];
+  const freed: string[] = [];
 
   if (options.depth !== undefined) {
     // Shallow: include commits at depth 0..D-1 from each want (their tree closures too);
     // the commits at depth D-1 are the new shallow boundaries (their parents are cut off).
-    const depth = options.depth;
-    const boundary = new Set<string>();
-    const visited = new Set<string>();
-    const queue: Array<[string, number]> = wants.map((w) => [w, 0]);
-    while (queue.length > 0) {
-      const [oid, d] = queue.shift()!;
-      if (visited.has(oid)) continue;
-      visited.add(oid);
-      const object = lookup(oid);
-      if (!object) continue;
-      objects.set(oid, object);
-      if (object.type === 'tag') {
+    const limit = options.depth;
+    const edgeSet = new Set<string>();
+    const seen = new Set<string>();
+    const pending: Array<[string, number]> = wants.map((w) => [w, 0]);
+    while (pending.length > 0) {
+      const [id, level] = pending.shift()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const found = fetch(id);
+      if (!found) continue;
+      picked.set(id, found);
+      if (found.type === 'tag') {
         // A tag want pulls its target at the same depth.
-        const target = parseTag(object.data).object;
-        if (target !== ZERO_OID && !visited.has(target)) queue.push([target, d]);
-      } else if (object.type === 'commit') {
-        const commit = parseCommit(object.data);
-        const treeClosure = collectReachable([commit.tree], lookup, { allowMissing: true });
-        for (const treeOid of treeClosure) {
-          const treeObject = lookup(treeOid);
-          if (treeObject) objects.set(treeOid, treeObject);
+        const goal = parseTag(found.data).object;
+        if (goal !== ZERO_OID && !seen.has(goal)) pending.push([goal, level]);
+      } else if (found.type === 'commit') {
+        const head = parseCommit(found.data);
+        const trees = collectReachable([head.tree], fetch, { allowMissing: true });
+        for (const tid of trees) {
+          const treeObj = fetch(tid);
+          if (treeObj) picked.set(tid, treeObj);
         }
-        if (d + 1 < depth) {
-          for (const parent of commit.parents) queue.push([parent, d + 1]);
+        if (level + 1 < limit) {
+          for (const parent of head.parents) pending.push([parent, level + 1]);
         } else {
-          // d + 1 === depth: this commit is the shallow boundary.
-          boundary.add(oid);
+          // level + 1 === depth: this commit is the shallow boundary.
+          edgeSet.add(id);
         }
       }
     }
-    for (const oid of boundary) shallow.push(oid);
+    for (const id of edgeSet) cut.push(id);
     // Old shallow boundaries that are now fully included become unshallow.
-    for (const old of options.shallowBoundaries ?? []) {
-      if (!boundary.has(old) && objects.has(old)) unshallow.push(old);
+    for (const prior of options.shallowBoundaries ?? []) {
+      if (!edgeSet.has(prior) && picked.has(prior)) freed.push(prior);
     }
     // Remove anything the client already has.
-    for (const oid of [...objects.keys()]) if (haveReachable.has(oid)) objects.delete(oid);
-    return { objects, shallow, unshallow };
+    for (const id of [...picked.keys()]) if (held.has(id)) picked.delete(id);
+    return { objects: picked, shallow: cut, unshallow: freed };
   }
 
-  const wantReachable = collectReachable(wants, lookup, { allowMissing: true });
-  for (const oid of wantReachable) {
-    if (haveReachable.has(oid)) continue;
-    const object = lookup(oid);
-    if (object) objects.set(oid, object);
+  const wanted = collectReachable(wants, fetch, { allowMissing: true });
+  for (const id of wanted) {
+    if (held.has(id)) continue;
+    const found = fetch(id);
+    if (found) picked.set(id, found);
   }
-  return { objects, shallow, unshallow };
+  return { objects: picked, shallow: cut, unshallow: freed };
 }
 
 export { isObjectId, ZERO_OID };

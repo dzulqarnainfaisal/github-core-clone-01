@@ -1,11 +1,11 @@
-// mcp.ts — Model Context Protocol over Streamable HTTP (JSON-RPC 2.0), modern era
-// (2026-07-28, server/discover) with the legacy initialize handshake as a fallback.
-// The tools act on the same store as REST, so MCP and REST read the same objects.
+// mcp.ts — Model Context Protocol over Streamable HTTP (JSON-RPC 2.0), current era
+// (2026-07-28, server/discover) with the older initialize handshake kept as a fallback.
+// The tools work on the same store as REST, so MCP and REST see the same objects.
 //
-// This is a rewrite of the first version. The wire behavior is identical — same tool
-// list (byte for byte), same JSON-RPC shapes, same error codes and messages — only
-// the internals are reorganised: the tool list is built by one small helper instead
-// of nested literals, and the request dispatch is a flat chain of early returns.
+// Second rewrite. The wire behavior is unchanged — same tool list (byte for byte),
+// same JSON-RPC shapes, same error codes and messages — only the internals move:
+// the tool list is assembled by one small builder, and dispatch is a flat chain
+// of early returns.
 
 import {
   FIXED_TIME,
@@ -22,7 +22,7 @@ export const MCP_REVISION = '2026-07-28';
 export const MCP_SERVER_NAME = 'github-core-clone';
 export const MCP_SERVER_VERSION = '1.0.0';
 
-interface ToolDef {
+interface ToolSpec {
   name: string;
   description: string;
   inputSchema: {
@@ -32,31 +32,31 @@ interface ToolDef {
   };
 }
 
-type PropDef = { type: string; description: string };
+type FieldSpec = { type: string; description: string };
 
-/** Build one frozen tool definition; the shape is fixed so tools/list is stable. */
-function defineTool(
-  name: string,
-  description: string,
-  properties: Record<string, PropDef>,
-  required: string[],
-): ToolDef {
-  const frozenProps: Record<string, PropDef> = {};
-  for (const [key, prop] of Object.entries(properties)) frozenProps[key] = Object.freeze(prop);
+/** Assemble one frozen tool definition; the shape is fixed so tools/list is stable. */
+function makeTool(
+  toolName: string,
+  blurb: string,
+  fields: Record<string, FieldSpec>,
+  mandatory: string[],
+): ToolSpec {
+  const sealedProps: Record<string, FieldSpec> = {};
+  for (const [key, spec] of Object.entries(fields)) sealedProps[key] = Object.freeze(spec);
   return Object.freeze({
-    name,
-    description,
+    name: toolName,
+    description: blurb,
     inputSchema: Object.freeze({
       type: 'object',
-      properties: Object.freeze(frozenProps),
-      required: Object.freeze(required),
+      properties: Object.freeze(sealedProps),
+      required: Object.freeze(mandatory),
     }),
   });
 }
 
 /** The tool list, a fixed constant: two tools/list calls answer byte for byte. */
-export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
-  defineTool(
+export const MCP_TOOLS: readonly ToolSpec[] = Object.freeze([
+  makeTool(
     'create_repo',
     'Create a repository owned by the authenticated user.',
     {
@@ -67,7 +67,7 @@ export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
     },
     ['name'],
   ),
-  defineTool(
+  makeTool(
     'get_repo',
     'Get a repository by owner and name.',
     {
@@ -76,7 +76,7 @@ export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
     },
     ['owner', 'repo'],
   ),
-  defineTool(
+  makeTool(
     'create_issue',
     'Create an issue in a repository.',
     {
@@ -87,7 +87,7 @@ export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
     },
     ['owner', 'repo', 'title'],
   ),
-  defineTool(
+  makeTool(
     'list_issues',
     'List the issues of a repository.',
     {
@@ -97,7 +97,7 @@ export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
     },
     ['owner', 'repo'],
   ),
-  defineTool(
+  makeTool(
     'create_pull_request',
     'Open a pull request from a head branch into a base branch.',
     {
@@ -110,7 +110,7 @@ export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
     },
     ['owner', 'repo', 'title', 'head', 'base'],
   ),
-  defineTool(
+  makeTool(
     'merge_pull_request',
     'Merge a pull request with a squash commit onto its base branch.',
     {
@@ -124,142 +124,142 @@ export const MCP_TOOLS: readonly ToolDef[] = Object.freeze([
 
 // --------------------------------------------------------------------------- tools
 
-function repoJson(repo: Repo): Record<string, unknown> {
+function repoView(item: Repo): Record<string, unknown> {
   return {
-    id: repo.id,
-    name: repo.name,
-    full_name: `${repo.owner}/${repo.name}`,
-    owner: { login: repo.owner },
-    description: repo.description,
-    private: repo.private,
-    default_branch: repo.defaultBranch,
-    created_at: repo.created_at,
-    updated_at: repo.updated_at,
-    html_url: `https://github.com/${repo.owner}/${repo.name}`,
+    id: item.id,
+    name: item.name,
+    full_name: `${item.owner}/${item.name}`,
+    owner: { login: item.owner },
+    description: item.description,
+    private: item.private,
+    default_branch: item.defaultBranch,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+    html_url: `https://github.com/${item.owner}/${item.name}`,
   };
 }
 
-function issueJson(repo: Repo, issue: { number: number; title: string; body: string; state: string; id: number }): Record<string, unknown> {
+function issueView(item: Repo, entry: { number: number; title: string; body: string; state: string; id: number }): Record<string, unknown> {
   return {
-    id: issue.id,
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
+    id: entry.id,
+    number: entry.number,
+    title: entry.title,
+    body: entry.body,
+    state: entry.state,
     created_at: FIXED_TIME,
     updated_at: FIXED_TIME,
   };
 }
 
-function pullJson(repo: Repo, pull: { number: number; title: string; body: string; state: string; headRef: string; baseRef: string; merged: boolean; merge_commit_sha: string | null; id: number }): Record<string, unknown> {
+function pullView(item: Repo, entry: { number: number; title: string; body: string; state: string; headRef: string; baseRef: string; merged: boolean; merge_commit_sha: string | null; id: number }): Record<string, unknown> {
   return {
-    id: pull.id,
-    number: pull.number,
-    title: pull.title,
-    body: pull.body,
-    state: pull.state,
-    merged: pull.merged,
-    merge_commit_sha: pull.merge_commit_sha,
-    head: { ref: pull.headRef, sha: repo.refs.get(`refs/heads/${pull.headRef}`) ?? '' },
-    base: { ref: pull.baseRef, sha: repo.refs.get(`refs/heads/${pull.baseRef}`) ?? '' },
+    id: entry.id,
+    number: entry.number,
+    title: entry.title,
+    body: entry.body,
+    state: entry.state,
+    merged: entry.merged,
+    merge_commit_sha: entry.merge_commit_sha,
+    head: { ref: entry.headRef, sha: item.refs.get(`refs/heads/${entry.headRef}`) ?? '' },
+    base: { ref: entry.baseRef, sha: item.refs.get(`refs/heads/${entry.baseRef}`) ?? '' },
     created_at: FIXED_TIME,
     updated_at: FIXED_TIME,
   };
 }
 
-interface ToolOutcome {
+interface CallOutcome {
   result: Record<string, unknown> | null;
   error: { code: number; message: string } | null;
 }
 
-function toolResult(value: unknown): Record<string, unknown> {
+function okPayload(value: unknown): Record<string, unknown> {
   const text = JSON.stringify(value);
   return { content: [{ type: 'text', text }], structuredContent: value, isError: false };
 }
 
-function toolError(message: string): Record<string, unknown> {
+function errPayload(message: string): Record<string, unknown> {
   return { content: [{ type: 'text', text: message }], isError: true };
 }
 
 /** Match a tool by name, forgiving case and separators (getRepo, get-repo, repo). */
-function findTool(name: string): ToolDef | undefined {
-  const wanted = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-  return MCP_TOOLS.find((tool) => {
-    const candidate = tool.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-    return candidate === wanted || candidate.endsWith(wanted);
+function lookupTool(name: string): ToolSpec | undefined {
+  const needle = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return MCP_TOOLS.find((spec) => {
+    const eachName = spec.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    return eachName === needle || eachName.endsWith(needle);
   });
 }
 
-function callTool(store: Store, viewerLogin: string, name: string, args: Record<string, unknown>): ToolOutcome {
-  const tool = findTool(name);
-  if (!tool) return { result: null, error: { code: -32602, message: `unknown tool ${name}` } };
-  const required = tool.inputSchema.required;
-  for (const key of required) {
-    if (args[key] === undefined || args[key] === null || args[key] === '') {
-      return { result: toolError(`missing required argument: ${key}`), error: null };
+function runTool(db: Store, viewer: string, name: string, inputs: Record<string, unknown>): CallOutcome {
+  const spec = lookupTool(name);
+  if (!spec) return { result: null, error: { code: -32602, message: `unknown tool ${name}` } };
+  const mandatory = spec.inputSchema.required;
+  for (const field of mandatory) {
+    if (inputs[field] === undefined || inputs[field] === null || inputs[field] === '') {
+      return { result: errPayload(`missing required argument: ${field}`), error: null };
     }
   }
-  const owner = typeof args.owner === 'string' && args.owner !== '' ? args.owner : viewerLogin;
-  const repoName = typeof args.repo === 'string' ? args.repo : typeof args.name === 'string' ? args.name : '';
+  const holder = typeof inputs.owner === 'string' && inputs.owner !== '' ? inputs.owner : viewer;
+  const repoSlug = typeof inputs.repo === 'string' ? inputs.repo : typeof inputs.name === 'string' ? inputs.name : '';
 
-  switch (tool.name) {
+  switch (spec.name) {
     case 'create_repo': {
-      const repoNameArg = String(args.name ?? '');
-      if (repoNameArg === '') return { result: toolError('missing required argument: name'), error: null };
-      const existing = getRepo(store, viewerLogin, repoNameArg);
-      if (existing) return { result: toolError(`repository ${viewerLogin}/${repoNameArg} already exists`), error: null };
-      const repo = createRepo(store, viewerLogin, repoNameArg, {
-        description: typeof args.description === 'string' ? args.description : '',
-        private: args.private === true,
+      const targetName = String(inputs.name ?? '');
+      if (targetName === '') return { result: errPayload('missing required argument: name'), error: null };
+      const clash = getRepo(db, viewer, targetName);
+      if (clash) return { result: errPayload(`repository ${viewer}/${targetName} already exists`), error: null };
+      const made = createRepo(db, viewer, targetName, {
+        description: typeof inputs.description === 'string' ? inputs.description : '',
+        private: inputs.private === true,
       });
-      return { result: toolResult(repoJson(repo)), error: null };
+      return { result: okPayload(repoView(made)), error: null };
     }
     case 'get_repo': {
-      const repo = getRepo(store, owner, repoName);
-      if (!repo) return { result: toolError(`repository ${owner}/${repoName} not found`), error: null };
-      return { result: toolResult(repoJson(repo)), error: null };
+      const item = getRepo(db, holder, repoSlug);
+      if (!item) return { result: errPayload(`repository ${holder}/${repoSlug} not found`), error: null };
+      return { result: okPayload(repoView(item)), error: null };
     }
     case 'create_issue': {
-      const repo = getRepo(store, owner, repoName);
-      if (!repo) return { result: toolError(`repository ${owner}/${repoName} not found`), error: null };
-      const created = createIssue(store, repo, {
-        title: String(args.title ?? ''),
-        body: typeof args.body === 'string' ? args.body : '',
+      const item = getRepo(db, holder, repoSlug);
+      if (!item) return { result: errPayload(`repository ${holder}/${repoSlug} not found`), error: null };
+      const made = createIssue(db, item, {
+        title: String(inputs.title ?? ''),
+        body: typeof inputs.body === 'string' ? inputs.body : '',
       });
-      if ('error' in created) return { result: toolError(`unknown label ${created.label}`), error: null };
-      return { result: toolResult(issueJson(repo, created)), error: null };
+      if ('error' in made) return { result: errPayload(`unknown label ${made.label}`), error: null };
+      return { result: okPayload(issueView(item, made)), error: null };
     }
     case 'list_issues': {
-      const repo = getRepo(store, owner, repoName);
-      if (!repo) return { result: toolError(`repository ${owner}/${repoName} not found`), error: null };
-      const state = typeof args.state === 'string' ? args.state.toLowerCase() : 'open';
-      const issues = [...repo.issues.values()]
-        .filter((issue) => state === 'all' || issue.state === state)
+      const item = getRepo(db, holder, repoSlug);
+      if (!item) return { result: errPayload(`repository ${holder}/${repoSlug} not found`), error: null };
+      const filter = typeof inputs.state === 'string' ? inputs.state.toLowerCase() : 'open';
+      const found = [...item.issues.values()]
+        .filter((entry) => filter === 'all' || entry.state === filter)
         .sort((a, b) => a.number - b.number)
-        .map((issue) => issueJson(repo, issue));
-      return { result: toolResult(issues), error: null };
+        .map((entry) => issueView(item, entry));
+      return { result: okPayload(found), error: null };
     }
     case 'create_pull_request': {
-      const repo = getRepo(store, owner, repoName);
-      if (!repo) return { result: toolError(`repository ${owner}/${repoName} not found`), error: null };
-      const created = createPull(store, repo, {
-        title: String(args.title ?? ''),
-        body: typeof args.body === 'string' ? args.body : '',
-        head: String(args.head ?? ''),
-        base: String(args.base ?? ''),
+      const item = getRepo(db, holder, repoSlug);
+      if (!item) return { result: errPayload(`repository ${holder}/${repoSlug} not found`), error: null };
+      const made = createPull(db, item, {
+        title: String(inputs.title ?? ''),
+        body: typeof inputs.body === 'string' ? inputs.body : '',
+        head: String(inputs.head ?? ''),
+        base: String(inputs.base ?? ''),
       });
-      if ('error' in created) return { result: toolError(`unknown branch ${created.branch}`), error: null };
-      return { result: toolResult(pullJson(repo, created)), error: null };
+      if ('error' in made) return { result: errPayload(`unknown branch ${made.branch}`), error: null };
+      return { result: okPayload(pullView(item, made)), error: null };
     }
     case 'merge_pull_request': {
-      const repo = getRepo(store, owner, repoName);
-      if (!repo) return { result: toolError(`repository ${owner}/${repoName} not found`), error: null };
-      const number = Number(args.pull_number);
-      const pull = repo.pulls.get(number);
-      if (!pull) return { result: toolError(`pull request #${number} not found`), error: null };
-      const merged = mergePull(repo, pull);
-      if ('error' in merged) return { result: toolError(`cannot merge pull request #${number}: ${merged.error}`), error: null };
-      return { result: toolResult({ ...pullJson(repo, pull), merged: true, sha: merged.mergeSha }), error: null };
+      const item = getRepo(db, holder, repoSlug);
+      if (!item) return { result: errPayload(`repository ${holder}/${repoSlug} not found`), error: null };
+      const num = Number(inputs.pull_number);
+      const entry = item.pulls.get(num);
+      if (!entry) return { result: errPayload(`pull request #${num} not found`), error: null };
+      const done = mergePull(item, entry);
+      if ('error' in done) return { result: errPayload(`cannot merge pull request #${num}: ${done.error}`), error: null };
+      return { result: okPayload({ ...pullView(item, entry), merged: true, sha: done.mergeSha }), error: null };
     }
     default:
       return { result: null, error: { code: -32602, message: `unknown tool ${name}` } };
@@ -281,33 +281,36 @@ export interface McpResponseBody {
   headers?: Record<string, string>;
 }
 
-function rpcResult(id: unknown, result: unknown): McpResponseBody {
-  return { status: 200, body: { jsonrpc: '2.0', id: id ?? null, result } };
+function okReply(msgId: unknown, result: unknown): McpResponseBody {
+  return { status: 200, body: { jsonrpc: '2.0', id: msgId ?? null, result } };
 }
 
-function rpcError(id: unknown, code: number, message: string, status = 200): McpResponseBody {
-  return { status, body: { jsonrpc: '2.0', id: id ?? null, error: { code, message } } };
+function errReply(msgId: unknown, code: number, message: string, status = 200): McpResponseBody {
+  return { status, body: { jsonrpc: '2.0', id: msgId ?? null, error: { code, message } } };
 }
 
-function discoverResult(): Record<string, unknown> {
+function discoverBody(): Record<string, unknown> {
+  const versions = [MCP_REVISION, '2025-11-25'];
+  const server = { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION };
   return {
     resultType: 'discover',
-    supportedVersions: [MCP_REVISION, '2025-11-25'],
+    supportedVersions: versions,
     capabilities: { tools: {} },
     instructions: 'A GitHub-compatible forge over MCP.',
-    serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+    serverInfo: server,
     _meta: {
       'io.modelcontextprotocol/protocolVersion': MCP_REVISION,
-      'io.modelcontextprotocol/serverInfo': { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+      'io.modelcontextprotocol/serverInfo': server,
     },
   };
 }
 
-function initializeResult(protocolVersion: string): Record<string, unknown> {
+function initializeBody(protocolVersion: string): Record<string, unknown> {
+  const server = { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION };
   return {
     protocolVersion,
     capabilities: { tools: {} },
-    serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+    serverInfo: server,
   };
 }
 
@@ -317,66 +320,66 @@ function initializeResult(protocolVersion: string): Record<string, unknown> {
  * declared one.
  */
 export function handleMcpRequest(
-  store: Store,
-  viewerLogin: string,
-  request: McpRequest,
-  protocolVersion: string | null,
+  db: Store,
+  viewer: string,
+  msg: McpRequest,
+  proto: string | null,
 ): McpResponseBody {
-  const headers: Record<string, string> = {};
-  if (protocolVersion !== null) headers['mcp-protocol-version'] = protocolVersion;
-  const id = request.id;
-  const isNotification = id === undefined || id === null;
-  const method = typeof request.method === 'string' ? request.method : '';
+  const outHeaders: Record<string, string> = {};
+  if (proto !== null) outHeaders['mcp-protocol-version'] = proto;
+  const msgId = msg.id;
+  const notifyOnly = msgId === undefined || msgId === null;
+  const verb = typeof msg.method === 'string' ? msg.method : '';
 
-  if (method === 'notifications/initialized' || method.startsWith('notifications/')) {
-    return { status: 202, body: null, headers };
+  if (verb === 'notifications/initialized' || verb.startsWith('notifications/')) {
+    return { status: 202, body: null, headers: outHeaders };
   }
 
-  if (method === 'server/discover') {
-    const body = rpcResult(id, discoverResult());
-    return { ...body, headers };
+  if (verb === 'server/discover') {
+    const reply = okReply(msgId, discoverBody());
+    return { ...reply, headers: outHeaders };
   }
 
-  if (method === 'initialize') {
-    const params = (request.params ?? {}) as Record<string, unknown>;
-    const wanted = typeof params.protocolVersion === 'string' ? params.protocolVersion : MCP_REVISION;
-    const negotiated = wanted === MCP_REVISION || wanted === '2025-11-25' ? wanted : MCP_REVISION;
-    const body = rpcResult(id, initializeResult(negotiated));
-    return { ...body, headers };
+  if (verb === 'initialize') {
+    const args = (msg.params ?? {}) as Record<string, unknown>;
+    const asked = typeof args.protocolVersion === 'string' ? args.protocolVersion : MCP_REVISION;
+    const settled = asked === MCP_REVISION || asked === '2025-11-25' ? asked : MCP_REVISION;
+    const reply = okReply(msgId, initializeBody(settled));
+    return { ...reply, headers: outHeaders };
   }
 
-  if (method === 'tools/list') {
-    const body = rpcResult(id, { tools: MCP_TOOLS });
-    return { ...body, headers };
+  if (verb === 'tools/list') {
+    const reply = okReply(msgId, { tools: MCP_TOOLS });
+    return { ...reply, headers: outHeaders };
   }
 
-  if (method === 'tools/call') {
-    const params = (request.params ?? {}) as Record<string, unknown>;
-    const name = typeof params.name === 'string' ? params.name : '';
-    const args = (params.arguments ?? {}) as Record<string, unknown>;
-    if (name === '') {
-      const body = rpcError(id, -32602, 'tools/call needs a tool name');
-      return { ...body, headers };
+  if (verb === 'tools/call') {
+    const args = (msg.params ?? {}) as Record<string, unknown>;
+    const toolName = typeof args.name === 'string' ? args.name : '';
+    const inputs = (args.arguments ?? {}) as Record<string, unknown>;
+    if (toolName === '') {
+      const reply = errReply(msgId, -32602, 'tools/call needs a tool name');
+      return { ...reply, headers: outHeaders };
     }
-    const outcome = callTool(store, viewerLogin, name, args);
-    if (outcome.error) {
-      const body = rpcError(id, outcome.error.code, outcome.error.message);
-      return { ...body, headers };
+    const done = runTool(db, viewer, toolName, inputs);
+    if (done.error) {
+      const reply = errReply(msgId, done.error.code, done.error.message);
+      return { ...reply, headers: outHeaders };
     }
-    const body = rpcResult(id, outcome.result);
-    return { ...body, headers };
+    const reply = okReply(msgId, done.result);
+    return { ...reply, headers: outHeaders };
   }
 
-  if (method === 'ping') {
-    const body = rpcResult(id, {});
-    return { ...body, headers };
+  if (verb === 'ping') {
+    const reply = okReply(msgId, {});
+    return { ...reply, headers: outHeaders };
   }
 
-  const body = rpcError(id, -32601, `method not found: ${method}`);
-  return { ...body, headers };
+  const reply = errReply(msgId, -32601, `method not found: ${verb}`);
+  return { ...reply, headers: outHeaders };
 }
 
 /** A raw (unparseable) body is HTTP 400 with JSON-RPC -32700. */
 export function mcpParseError(): McpResponseBody {
-  return rpcError(null, -32700, 'Parse error', 400);
+  return errReply(null, -32700, 'Parse error', 400);
 }
